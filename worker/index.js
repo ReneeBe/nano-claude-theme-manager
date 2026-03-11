@@ -73,8 +73,39 @@ No gradients on the swatches themselves — solid fills only. Clean white backgr
   };
 }
 
+// Step 1b: Generate a tileable background pattern image with Gemini
+async function generatePatternImage(backgroundStyle, geminiApiKey) {
+  const prompt = `A seamless tileable ${backgroundStyle} pattern texture for use as a website background.
+Flat graphic style, clean edges that tile perfectly, no text or labels, square format.
+The pattern should be clearly recognizable as ${backgroundStyle}.`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+      }),
+    }
+  );
+
+  if (!res.ok) return null; // soft fail — don't break the whole request
+
+  const data = await res.json();
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  const imagePart = parts.find((p) => p.inlineData?.mimeType?.startsWith("image/"));
+  if (!imagePart) return null;
+
+  return {
+    base64: imagePart.inlineData.data,
+    mimeType: imagePart.inlineData.mimeType,
+  };
+}
+
 // Step 2: Send image + description to Claude to extract ThemeVars
-async function extractThemeVars(description, imageBase64, imageMimeType, anthropicApiKey) {
+async function extractThemeVars(description, imageBase64, imageMimeType, anthropicApiKey, backgroundStyle) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -167,11 +198,15 @@ export default {
       });
     }
 
-    let description;
+    let description, geminiApiKey, anthropicApiKey, backgroundStyle;
     try {
       const body = await request.json();
       description = body.description?.trim();
       if (!description) throw new Error("Missing description");
+      // Use request-provided keys if present, fall back to env secrets
+      geminiApiKey = body.geminiApiKey?.trim() || env.GOOGLE_API_KEY;
+      anthropicApiKey = body.anthropicApiKey?.trim() || env.ANTHROPIC_API_KEY;
+      backgroundStyle = body.backgroundStyle?.trim() || null;
     } catch (e) {
       return new Response(JSON.stringify({ error: e.message }), {
         status: 400,
@@ -181,12 +216,20 @@ export default {
 
     try {
       // Step 1: Generate palette image with Gemini
-      const { base64, mimeType } = await generatePaletteImage(description, env.GOOGLE_API_KEY);
+      const { base64, mimeType } = await generatePaletteImage(description, geminiApiKey);
 
-      // Step 2: Extract ThemeVars with Claude vision
-      const vars = await extractThemeVars(description, base64, mimeType, env.ANTHROPIC_API_KEY);
+      // Step 2 (parallel): Extract ThemeVars with Claude + optionally generate a pattern image
+      const [vars, patternImage] = await Promise.all([
+        extractThemeVars(description, base64, mimeType, anthropicApiKey, backgroundStyle),
+        backgroundStyle ? generatePatternImage(backgroundStyle, geminiApiKey) : Promise.resolve(null),
+      ]);
 
-      return new Response(JSON.stringify(vars), {
+      // If Gemini generated a pattern image, use it as --bg-pattern data URI
+      if (patternImage) {
+        vars["--bg-pattern"] = `url("data:${patternImage.mimeType};base64,${patternImage.base64}")`;
+      }
+
+      return new Response(JSON.stringify({ vars, paletteImage: { base64, mimeType } }), {
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       });
     } catch (e) {
